@@ -5,7 +5,5 @@
   "backend_framework": "axum",
   "frontend_language": "rust",
   "frontend_framework": "leptos",
-  "database": "sqlite",
-  "task_id": "Fund_Transparency_Remediation",
-  "description": "A community-focused fundraising platform with a focus on spending transparency and auditability."
+  "database": "sqlite"
 }
