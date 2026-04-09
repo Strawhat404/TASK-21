@@ -1,0 +1,10 @@
+{
+    "name": "Fund Transparency Portal",
+    "short_name": "FundTransparency",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#f8fafc",
+    "theme_color": "#2563eb",
+    "description": "Transparent fund tracking and project management platform",
+    "icons": []
+}
