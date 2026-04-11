@@ -107,3 +107,109 @@ pub fn decrypt(encoded: &str, key: &[u8; 32]) -> Result<String, String> {
 
     String::from_utf8(plaintext).map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_key() -> [u8; 32] {
+        [0xAB; 32]
+    }
+
+    fn temp_path(label: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!(
+            "{}/test_key_{}_{}_{}",
+            std::env::temp_dir().display(),
+            label,
+            std::process::id(),
+            nanos
+        )
+    }
+
+    #[test]
+    fn test_string_encrypt_decrypt_roundtrip() {
+        let key = test_key();
+        let plaintext = "hello world";
+        let encrypted = encrypt(plaintext, &key).expect("encrypt ok");
+        let decrypted = decrypt(&encrypted, &key).expect("decrypt ok");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_bytes_encrypt_decrypt_roundtrip() {
+        let key = test_key();
+        let plaintext = b"binary data \x00\xff";
+        let encrypted = encrypt_bytes(plaintext, &key).expect("encrypt ok");
+        let decrypted = decrypt_bytes(&encrypted, &key).expect("decrypt ok");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_decrypt_with_wrong_key_fails() {
+        let key_a = [0x01; 32];
+        let key_b = [0x02; 32];
+        let encrypted = encrypt("secret", &key_a).expect("encrypt ok");
+        assert!(decrypt(&encrypted, &key_b).is_err());
+    }
+
+    #[test]
+    fn test_decrypt_garbage_base64_fails() {
+        let key = test_key();
+        // Valid base64 but garbage ciphertext
+        let garbage = STANDARD.encode(vec![0u8; 20]);
+        assert!(decrypt(&garbage, &key).is_err());
+    }
+
+    #[test]
+    fn test_decrypt_bytes_too_short() {
+        let key = test_key();
+        let short = vec![0u8; 12]; // exactly 12 bytes, < 13
+        let result = decrypt_bytes(&short, &key);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Ciphertext too short");
+    }
+
+    #[test]
+    fn test_load_or_create_key_short_file_error() {
+        let path = temp_path("short");
+        std::fs::write(&path, &[0u8; 10]).expect("write short file");
+        let result = load_or_create_key_at(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("malformed"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_load_or_create_key_generates_file() {
+        let path = temp_path("autogen");
+        assert!(!Path::new(&path).exists());
+        let key = load_or_create_key_at(&path).expect("should create key");
+        assert_eq!(key.len(), 32);
+        assert!(Path::new(&path).exists());
+        // Loading again should return the same key
+        let key2 = load_or_create_key_at(&path).expect("should load key");
+        assert_eq!(key, key2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_empty_string_encrypt_decrypt_roundtrip() {
+        let key = test_key();
+        let encrypted = encrypt("", &key).expect("encrypt ok");
+        let decrypted = decrypt(&encrypted, &key).expect("decrypt ok");
+        assert_eq!(decrypted, "");
+    }
+
+    #[test]
+    fn test_two_encryptions_differ() {
+        let key = test_key();
+        let a = encrypt("same", &key).expect("encrypt ok");
+        let b = encrypt("same", &key).expect("encrypt ok");
+        assert_ne!(a, b, "two encryptions of same plaintext should differ due to random nonce");
+    }
+}

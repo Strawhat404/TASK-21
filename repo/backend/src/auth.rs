@@ -89,3 +89,72 @@ pub fn generate_nonce() -> String {
     let bytes: [u8; 16] = rand::thread_rng().gen();
     hex::encode(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hash_and_verify_roundtrip() {
+        let password = "correct-horse-battery-staple";
+        let hash = hash_password(password).expect("hashing should succeed");
+        assert!(verify_password(password, &hash));
+    }
+
+    #[test]
+    fn test_wrong_password_fails() {
+        let hash = hash_password("secret").expect("hashing should succeed");
+        assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn test_invalid_hash_returns_false() {
+        assert!(!verify_password("anything", "not-a-valid-hash"));
+    }
+
+    #[test]
+    fn test_token_create_and_validate_roundtrip() {
+        let secret = b"test-secret-key-1234";
+        let token = create_session_token("user42", secret, 3600);
+        let result = validate_session_token(&token, secret);
+        assert_eq!(result, Some("user42".to_string()));
+    }
+
+    #[test]
+    fn test_token_wrong_secret_fails() {
+        let token = create_session_token("user42", b"secret-a", 3600);
+        let result = validate_session_token(&token, b"secret-b");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_tampered_token_fails() {
+        let secret = b"my-secret";
+        let token = create_session_token("user1", secret, 3600);
+        // Tamper with the signature portion
+        let tampered = format!("{}x", token);
+        assert_eq!(validate_session_token(&tampered, secret), None);
+    }
+
+    #[test]
+    fn test_token_invalid_format_returns_none() {
+        let secret = b"key";
+        assert_eq!(validate_session_token("no-dot-here", secret), None);
+        assert_eq!(validate_session_token("", secret), None);
+        assert_eq!(validate_session_token("a.b.c", secret), None);
+    }
+
+    #[test]
+    fn test_nonce_is_32_char_hex() {
+        let nonce = generate_nonce();
+        assert_eq!(nonce.len(), 32);
+        assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_two_nonces_differ() {
+        let a = generate_nonce();
+        let b = generate_nonce();
+        assert_ne!(a, b);
+    }
+}

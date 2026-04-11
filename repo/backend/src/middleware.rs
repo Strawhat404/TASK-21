@@ -167,3 +167,51 @@ pub fn require_project_owner(db: &DbPool, user_id: &str, project_id: &str) -> Re
         Err(StatusCode::FORBIDDEN)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn test_rate_limit_allows_under_limit() {
+        let rl = RateLimitState::new(3, 60);
+        assert!(rl.check("client1"));
+        assert!(rl.check("client1"));
+        assert!(rl.check("client1"));
+    }
+
+    #[test]
+    fn test_rate_limit_blocks_over_limit() {
+        let rl = RateLimitState::new(2, 60);
+        assert!(rl.check("client1"));
+        assert!(rl.check("client1"));
+        assert!(!rl.check("client1"), "third request should be blocked");
+    }
+
+    #[test]
+    fn test_rate_limit_independent_keys() {
+        let rl = RateLimitState::new(1, 60);
+        assert!(rl.check("a"));
+        assert!(!rl.check("a"), "second request for 'a' blocked");
+        assert!(rl.check("b"), "'b' should still be allowed");
+    }
+
+    #[test]
+    fn test_require_auth_empty_extensions() {
+        let ext = axum::http::Extensions::new();
+        let result = require_auth(&ext);
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_require_auth_with_user() {
+        let mut ext = axum::http::Extensions::new();
+        ext.insert(AuthUser {
+            user_id: "u1".into(),
+        });
+        let result = require_auth(&ext);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().user_id, "u1");
+    }
+}

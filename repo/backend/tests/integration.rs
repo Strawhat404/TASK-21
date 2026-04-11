@@ -633,17 +633,17 @@ fn dashboard_stats_with_cause_filter() {
     db::create_donation(&pool, "don1", "PLG-001", "p1", "d1", 5000, "cash", false, None, None).unwrap();
     db::create_donation(&pool, "don2", "PLG-002", "p2", "d1", 3000, "cash", false, None, None).unwrap();
 
-    // All donations
+    // All donations (seed data adds 75000 + 120000 = 195000 from sample projects)
     let all = db::get_dashboard_stats(&pool, None, None, None, None);
-    assert_eq!(all.gmv_cents, 8000);
+    assert_eq!(all.gmv_cents, 195000 + 8000);
 
     // Filter by health cause only
     let health = db::get_dashboard_stats(&pool, None, None, Some("health"), None);
     assert_eq!(health.gmv_cents, 5000);
 
-    // Filter by education cause only
+    // Filter by education cause only (seed data adds 75000 from education project)
     let edu = db::get_dashboard_stats(&pool, None, None, Some("education"), None);
-    assert_eq!(edu.gmv_cents, 3000);
+    assert_eq!(edu.gmv_cents, 75000 + 3000);
 }
 
 // ══════════════════════════════════════════════
@@ -1352,10 +1352,11 @@ fn confirmation_token_rejects_mismatched_params() {
 #[test]
 fn ops_log_is_immutable() {
     let pool = test_db();
-    // Insert works
+    // Insert works (seed data already inserts 1 ops_log entry)
+    let baseline = db::get_ops_log(&pool, 100, 0).len();
     db::append_ops_log(&pool, "actor1", "Actor", "test_action", "test detail");
-    let log = db::get_ops_log(&pool, 10, 0);
-    assert_eq!(log.len(), 1);
+    let log = db::get_ops_log(&pool, 100, 0);
+    assert_eq!(log.len(), baseline + 1);
 
     let entry_id = &log[0].id;
 
@@ -1659,4 +1660,718 @@ async fn route_comment_delete_requires_confirmation_token() {
     // Comment should now be deleted
     let comments = db::list_comments(&state.db, "p1");
     assert_eq!(comments.len(), 0, "Comment should be deleted");
+}
+
+// ══════════════════════════════════════════════
+// Additional API integration tests — happy-path coverage
+// ══════════════════════════════════════════════
+
+/// GET /api/auth/me returns the authenticated user's profile.
+#[tokio::test]
+async fn route_auth_me_returns_user_profile() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let token = register_user(&app, "me@test.com", "password123", "MeUser").await;
+
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .uri("/api/auth/me")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(val["email"], "me@test.com");
+    assert_eq!(val["display_name"], "MeUser");
+    assert_eq!(val["role"], "supporter");
+}
+
+/// GET /api/auth/me without token returns 401.
+#[tokio::test]
+async fn route_auth_me_unauthenticated_rejected() {
+    let state = test_state();
+    let app = build_app(state);
+
+    let resp = app.oneshot(
+        Request::builder()
+            .uri("/api/auth/me")
+            .body(Body::empty())
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// POST /api/auth/login with valid credentials returns a token and user.
+#[tokio::test]
+async fn route_login_valid_credentials() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let _token = register_user(&app, "login@test.com", "password123", "LoginUser").await;
+
+    // Now login with the same credentials
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "email": "login@test.com",
+        "password": "password123"
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .header("Content-Type", "application/json")
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(val["token"].is_string(), "Login should return a token");
+    assert_eq!(val["user"]["email"], "login@test.com");
+    assert_eq!(val["user"]["display_name"], "LoginUser");
+}
+
+/// POST /api/auth/login with invalid password returns 401.
+#[tokio::test]
+async fn route_login_invalid_password() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let _token = register_user(&app, "badpw@test.com", "password123", "BadPw").await;
+
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "email": "badpw@test.com",
+        "password": "wrongpassword"
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .header("Content-Type", "application/json")
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// POST /api/auth/login with nonexistent email returns 401.
+#[tokio::test]
+async fn route_login_nonexistent_email() {
+    let state = test_state();
+    let app = build_app(state.clone());
+
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "email": "nobody@test.com",
+        "password": "password123"
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .header("Content-Type", "application/json")
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// POST /api/projects — create a project with budget lines, verify response.
+#[tokio::test]
+async fn route_create_project_happy_path() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let token = register_user(&app, "pm@test.com", "password123", "PM").await;
+
+    // Promote to project_manager
+    let uid = auth::validate_session_token(&token, &state.hmac_secret).unwrap();
+    db::update_user_role(&state.db, &uid, "project_manager").unwrap();
+
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "title": "Clean Water Initiative",
+        "description": "Provide clean water to rural communities",
+        "cause": "health",
+        "zip_code": "12345",
+        "goal_cents": 100000,
+        "budget_lines": [
+            { "name": "Pipes", "allocated_cents": 50000 },
+            { "name": "Labor", "allocated_cents": 50000 }
+        ]
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/projects")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(val["title"], "Clean Water Initiative");
+    assert_eq!(val["cause"], "health");
+    assert_eq!(val["goal_cents"], 100000);
+    assert_eq!(val["status"], "active");
+    assert!(val["id"].is_string(), "Response should include a project id");
+}
+
+/// POST /api/projects — supporter cannot create projects.
+#[tokio::test]
+async fn route_create_project_supporter_rejected() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let token = register_user(&app, "sup@test.com", "password123", "Sup").await;
+    // User is a supporter by default — should be forbidden
+
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "title": "Blocked",
+        "description": "Should fail",
+        "cause": "education",
+        "zip_code": "00000",
+        "goal_cents": 10000,
+        "budget_lines": []
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/projects")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// GET /api/projects — list returns created projects.
+#[tokio::test]
+async fn route_list_projects_returns_created() {
+    let state = test_state();
+    let hash = auth::hash_password("pass1234").unwrap();
+    db::create_user(&state.db, "mgr1", "m@test.com", "Mgr", &hash, "project_manager").unwrap();
+    db::create_project(&state.db, "p1", "Alpha", "Desc A", "health", "11111", 50000, "mgr1", &[]).unwrap();
+    db::create_project(&state.db, "p2", "Beta", "Desc B", "education", "22222", 30000, "mgr1", &[]).unwrap();
+
+    let mgr_token = auth::create_session_token("mgr1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .uri("/api/projects")
+            .header("Authorization", format!("Bearer {}", mgr_token))
+            .body(Body::empty())
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // DB is seeded with sample projects, so total includes those plus our 2
+    let total = val["total"].as_i64().unwrap();
+    assert!(total >= 2, "Should have at least 2 projects, got {}", total);
+    let items = val["items"].as_array().unwrap();
+    let titles: Vec<&str> = items.iter().filter_map(|i| i["title"].as_str()).collect();
+    assert!(titles.contains(&"Alpha"), "Should contain project Alpha");
+    assert!(titles.contains(&"Beta"), "Should contain project Beta");
+}
+
+/// POST /api/donations — create a donation and verify response.
+#[tokio::test]
+async fn route_donation_happy_path() {
+    let state = test_state();
+    let hash = auth::hash_password("pass1234").unwrap();
+    db::create_user(&state.db, "mgr1", "m@test.com", "Mgr", &hash, "project_manager").unwrap();
+    db::create_user(&state.db, "donor1", "d@test.com", "Donor", &hash, "supporter").unwrap();
+    db::create_project(&state.db, "p1", "Proj", "Desc", "health", "11111", 100000, "mgr1", &[]).unwrap();
+
+    let donor_token = auth::create_session_token("donor1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "project_id": "p1",
+        "amount_cents": 5000,
+        "payment_method": "cash"
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/donations")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", donor_token))
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(val["donation"]["amount_cents"], 5000);
+    assert_eq!(val["donation"]["project_id"], "p1");
+    assert_eq!(val["donation"]["donor_id"], "donor1");
+    assert!(val["donation"]["pledge_number"].as_str().unwrap().starts_with("PLG-"));
+}
+
+/// POST /api/donations — zero amount rejected.
+#[tokio::test]
+async fn route_donation_zero_amount_rejected() {
+    let state = test_state();
+    let hash = auth::hash_password("pass1234").unwrap();
+    db::create_user(&state.db, "mgr1", "m@test.com", "Mgr", &hash, "project_manager").unwrap();
+    db::create_user(&state.db, "donor1", "d@test.com", "Donor", &hash, "supporter").unwrap();
+    db::create_project(&state.db, "p1", "Proj", "Desc", "health", "11111", 100000, "mgr1", &[]).unwrap();
+
+    let donor_token = auth::create_session_token("donor1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "project_id": "p1",
+        "amount_cents": 0,
+        "payment_method": "cash"
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/donations")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", donor_token))
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// POST /api/fulfillments — create fulfillment for owned project.
+#[tokio::test]
+async fn route_create_fulfillment_happy_path() {
+    let state = test_state();
+    let hash = auth::hash_password("pass1234").unwrap();
+    db::create_user(&state.db, "mgr1", "m@test.com", "Mgr", &hash, "project_manager").unwrap();
+    db::create_project(&state.db, "p1", "Proj", "Desc", "health", "11111", 50000, "mgr1", &[]).unwrap();
+
+    let mgr_token = auth::create_session_token("mgr1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({ "project_id": "p1" });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/fulfillments")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", mgr_token))
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(val["project_id"], "p1");
+    assert!(val["id"].is_string(), "Fulfillment should have an id");
+}
+
+/// POST /api/fulfillments/code — generate checkpoint code.
+#[tokio::test]
+async fn route_generate_checkpoint_code() {
+    let state = test_state();
+    let hash = auth::hash_password("pass1234").unwrap();
+    db::create_user(&state.db, "mgr1", "m@test.com", "Mgr", &hash, "project_manager").unwrap();
+    db::create_project(&state.db, "p1", "Proj", "Desc", "health", "11111", 50000, "mgr1", &[]).unwrap();
+    db::create_fulfillment(&state.db, "f1", "p1").unwrap();
+
+    let mgr_token = auth::create_session_token("mgr1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "fulfillment_id": "f1",
+        "checkpoint": "arrival"
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/fulfillments/code")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", mgr_token))
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(val["code"].is_string(), "Should return a code");
+    assert_eq!(val["code"].as_str().unwrap().len(), 6, "Code should be 6 digits");
+    assert_eq!(val["checkpoint"], "arrival");
+    assert!(val["expires_at"].is_string(), "Should return an expiry");
+}
+
+/// POST /api/fulfillments/checkpoint — record checkpoint with valid code.
+#[tokio::test]
+async fn route_record_checkpoint_with_valid_code() {
+    let state = test_state();
+    let hash = auth::hash_password("pass1234").unwrap();
+    db::create_user(&state.db, "mgr1", "m@test.com", "Mgr", &hash, "project_manager").unwrap();
+    db::create_project(&state.db, "p1", "Proj", "Desc", "health", "11111", 50000, "mgr1", &[]).unwrap();
+    db::create_fulfillment(&state.db, "f1", "p1").unwrap();
+
+    let mgr_token = auth::create_session_token("mgr1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    // Step 1: generate the code
+    let nonce1 = get_nonce(&app).await;
+    let gen_body = serde_json::json!({
+        "fulfillment_id": "f1",
+        "checkpoint": "arrival"
+    });
+    let gen_resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/fulfillments/code")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", mgr_token))
+            .header("X-Nonce", &nonce1)
+            .body(Body::from(serde_json::to_vec(&gen_body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(gen_resp.status(), StatusCode::OK);
+
+    let gen_bytes = axum::body::to_bytes(gen_resp.into_body(), 1_048_576).await.unwrap();
+    let gen_val: serde_json::Value = serde_json::from_slice(&gen_bytes).unwrap();
+    let code = gen_val["code"].as_str().unwrap().to_string();
+
+    // Step 2: record the checkpoint using that code
+    let nonce2 = get_nonce(&app).await;
+    let cp_body = serde_json::json!({
+        "fulfillment_id": "f1",
+        "checkpoint": "arrival",
+        "code": code
+    });
+    let cp_resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/fulfillments/checkpoint")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", mgr_token))
+            .header("X-Nonce", &nonce2)
+            .body(Body::from(serde_json::to_vec(&cp_body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(cp_resp.status(), StatusCode::OK);
+
+    // Verify checkpoint was recorded in the DB
+    let f = db::get_fulfillment(&state.db, "f1").unwrap();
+    assert!(f.arrival_at.is_some(), "Arrival checkpoint should be recorded");
+}
+
+/// POST /api/events/track — anonymous event tracking works (public route).
+#[tokio::test]
+async fn route_track_event_anonymous() {
+    let state = test_state();
+    let app = build_app(state.clone());
+
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "event_kind": "click",
+        "target_type": "button",
+        "target_id": "donate-btn",
+        "session_id": "sess-anon-123"
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/events/track")
+            .header("Content-Type", "application/json")
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(val["message"].is_string(), "Should return a success message");
+}
+
+/// POST + GET /api/webhooks — create and list webhooks (admin only).
+#[tokio::test]
+async fn route_webhook_create_and_list() {
+    let state = test_state();
+    let hash = auth::hash_password("adminpass").unwrap();
+    db::create_user(&state.db, "admin1", "a@test.com", "Admin", &hash, "administrator").unwrap();
+
+    let admin_token = auth::create_session_token("admin1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    // Create a webhook with a local URL
+    let nonce1 = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "name": "Test Hook",
+        "url": "http://10.0.0.5/webhook",
+        "event_types": ["donation.created"]
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/webhooks")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", admin_token))
+            .header("X-Nonce", &nonce1)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let create_bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&create_bytes).unwrap();
+    assert_eq!(created["name"], "Test Hook");
+    assert!(created["id"].is_string());
+    assert!(created["secret"].is_string(), "Webhook should include a signing secret");
+
+    // List webhooks
+    let resp2 = app.clone().oneshot(
+        Request::builder()
+            .uri("/api/webhooks")
+            .header("Authorization", format!("Bearer {}", admin_token))
+            .body(Body::empty())
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+
+    let list_bytes = axum::body::to_bytes(resp2.into_body(), 1_048_576).await.unwrap();
+    let hooks: Vec<serde_json::Value> = serde_json::from_slice(&list_bytes).unwrap();
+    assert_eq!(hooks.len(), 1);
+    assert_eq!(hooks[0]["name"], "Test Hook");
+}
+
+/// DELETE /api/webhooks/:id — delete a webhook.
+#[tokio::test]
+async fn route_webhook_delete() {
+    let state = test_state();
+    let hash = auth::hash_password("adminpass").unwrap();
+    db::create_user(&state.db, "admin1", "a@test.com", "Admin", &hash, "administrator").unwrap();
+
+    // Create a webhook directly in DB
+    db::create_webhook(&state.db, "wh1", "Hook1", "http://10.0.0.1/hook", "secret123", "[\"donation.created\"]").unwrap();
+
+    let admin_token = auth::create_session_token("admin1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    let nonce = get_nonce(&app).await;
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("DELETE")
+            .uri("/api/webhooks/wh1")
+            .header("Authorization", format!("Bearer {}", admin_token))
+            .header("X-Nonce", &nonce)
+            .body(Body::empty())
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(val["message"], "Webhook deleted");
+
+    // Verify it's gone
+    let hooks = db::list_webhooks(&state.db);
+    assert_eq!(hooks.len(), 0, "Webhook should be deleted");
+}
+
+/// POST /api/finance/review — verify expense status changes after approval.
+#[tokio::test]
+async fn route_finance_review_changes_expense_status() {
+    let state = test_state();
+    let hash = auth::hash_password("finpass").unwrap();
+    db::create_user(&state.db, "fin1", "f@test.com", "Finance", &hash, "finance_reviewer").unwrap();
+    db::create_user(&state.db, "mgr1", "m@test.com", "Mgr", &hash, "project_manager").unwrap();
+
+    let bl = vec![("bl1".to_string(), "Materials".to_string(), 50000i64)];
+    db::create_project(&state.db, "p1", "Proj", "Desc", "education", "11111", 100000, "mgr1", &bl).unwrap();
+    db::create_expense(&state.db, "e1", "p1", "bl1", 5000, "Lumber", None).unwrap();
+
+    let fin_token = auth::create_session_token("fin1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    // Approve the expense
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "expense_id": "e1",
+        "approved": true,
+        "note": "Looks good"
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/finance/review")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", fin_token))
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify expense status changed in DB
+    let expenses = db::list_expenses(&state.db, "p1", &state.encryption_key);
+    assert_eq!(expenses.len(), 1);
+    assert_eq!(expenses[0].disclosure_status, common::DisclosureStatus::Approved);
+}
+
+/// POST /api/finance/review — rejection sets status to rejected.
+#[tokio::test]
+async fn route_finance_review_rejection() {
+    let state = test_state();
+    let hash = auth::hash_password("finpass").unwrap();
+    db::create_user(&state.db, "fin1", "f@test.com", "Finance", &hash, "finance_reviewer").unwrap();
+    db::create_user(&state.db, "mgr1", "m@test.com", "Mgr", &hash, "project_manager").unwrap();
+
+    let bl = vec![("bl1".to_string(), "Materials".to_string(), 50000i64)];
+    db::create_project(&state.db, "p1", "Proj", "Desc", "education", "11111", 100000, "mgr1", &bl).unwrap();
+    db::create_expense(&state.db, "e1", "p1", "bl1", 5000, "Overpriced lumber", None).unwrap();
+
+    let fin_token = auth::create_session_token("fin1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "expense_id": "e1",
+        "approved": false,
+        "note": "Too expensive"
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/finance/review")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", fin_token))
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let expenses = db::list_expenses(&state.db, "p1", &state.encryption_key);
+    assert_eq!(expenses[0].disclosure_status, common::DisclosureStatus::Rejected);
+}
+
+/// GET /api/admin/export/csv — admin gets text/csv response.
+#[tokio::test]
+async fn route_csv_export_returns_csv_content_type() {
+    let state = test_state();
+    let hash = auth::hash_password("adminpass").unwrap();
+    db::create_user(&state.db, "admin1", "a@test.com", "Admin", &hash, "administrator").unwrap();
+    db::create_user(&state.db, "mgr1", "m@test.com", "Mgr", &hash, "project_manager").unwrap();
+    db::create_user(&state.db, "donor1", "d@test.com", "Donor", &hash, "supporter").unwrap();
+    db::create_project(&state.db, "p1", "Proj", "Desc", "health", "11111", 50000, "mgr1", &[]).unwrap();
+    db::create_donation(&state.db, "d1", "PLG-001", "p1", "donor1", 5000, "cash", false, None, None).unwrap();
+
+    let admin_token = auth::create_session_token("admin1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .uri("/api/admin/export/csv")
+            .header("Authorization", format!("Bearer {}", admin_token))
+            .body(Body::empty())
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    assert_eq!(content_type, "text/csv");
+
+    let disposition = resp.headers().get("content-disposition").unwrap().to_str().unwrap();
+    assert!(disposition.contains("donations.csv"), "Should suggest donations.csv filename");
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+    let csv_text = std::str::from_utf8(&bytes).unwrap();
+    assert!(csv_text.contains("PLG-001"), "CSV should contain the donation pledge number");
+}
+
+/// POST /api/events/track — authenticated event tracking includes user id.
+#[tokio::test]
+async fn route_track_event_authenticated() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let token = register_user(&app, "tracker@test.com", "password123", "Tracker").await;
+
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "event_kind": "impression",
+        "target_type": "project",
+        "target_id": "proj-123",
+        "session_id": "sess-auth-456",
+        "dwell_ms": 1500
+    });
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/events/track")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Webhook non-admin is forbidden from creating/listing/deleting.
+#[tokio::test]
+async fn route_webhook_non_admin_forbidden() {
+    let state = test_state();
+    let hash = auth::hash_password("pass1234").unwrap();
+    db::create_user(&state.db, "mgr1", "m@test.com", "Mgr", &hash, "project_manager").unwrap();
+
+    let mgr_token = auth::create_session_token("mgr1", &state.hmac_secret, 3600);
+    let app = build_app(state.clone());
+
+    // Try to list webhooks as non-admin
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .uri("/api/webhooks")
+            .header("Authorization", format!("Bearer {}", mgr_token))
+            .body(Body::empty())
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Try to create webhook as non-admin
+    let nonce = get_nonce(&app).await;
+    let body = serde_json::json!({
+        "name": "Forbidden Hook",
+        "url": "http://10.0.0.1/hook",
+        "event_types": ["donation.created"]
+    });
+    let resp2 = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/webhooks")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", mgr_token))
+            .header("X-Nonce", &nonce)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
 }
