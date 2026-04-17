@@ -38,14 +38,24 @@ if command -v cargo &>/dev/null; then
     else
         fail "Backend cargo tests failed"
     fi
-elif [ -n "$COMPOSE" ]; then
-    echo "  cargo not found — running via Docker..."
-    if $COMPOSE -f "$SCRIPT_DIR/docker-compose.yml" run --rm --no-deps \
-        -e DATABASE_URL=":memory:" backend \
-        sh -c "cd /app && cargo test --package server" 2>&1; then
-        pass "Backend cargo tests passed (Docker)"
+elif command -v docker &>/dev/null; then
+    echo "  cargo not found — building test image from builder stage..."
+    # Build a test image using the builder stage (which has the full Rust toolchain)
+    if docker build \
+        --target builder \
+        -t fund-transparency-test \
+        -f "$SCRIPT_DIR/backend/Dockerfile" \
+        "$SCRIPT_DIR" > /dev/null 2>&1; then
+        if docker run --rm \
+            -e DATABASE_URL=":memory:" \
+            fund-transparency-test \
+            sh -c "cargo test --package server 2>&1"; then
+            pass "Backend cargo tests passed (Docker builder)"
+        else
+            fail "Backend cargo tests failed (Docker builder)"
+        fi
     else
-        fail "Backend cargo tests failed (Docker)"
+        fail "Backend cargo tests failed (could not build test image)"
     fi
 else
     skip "Backend cargo tests (no cargo or Docker available)"
@@ -71,14 +81,23 @@ elif command -v cargo &>/dev/null; then
     else
         skip "Frontend WASM tests (wasm-pack not available, cargo test may not cover wasm_bindgen_test)"
     fi
-elif [ -n "$COMPOSE" ]; then
+elif command -v docker &>/dev/null; then
     echo "  No local toolchain — running via Docker..."
-    if $COMPOSE -f "$SCRIPT_DIR/docker-compose.yml" run --rm --no-deps \
-        -e DATABASE_URL=":memory:" backend \
-        sh -c "cd /app && cargo test --package web 2>&1 || true" 2>&1; then
-        pass "Frontend tests passed (Docker, cargo test)"
+    if docker build \
+        --target builder \
+        -t fund-transparency-test \
+        -f "$SCRIPT_DIR/backend/Dockerfile" \
+        "$SCRIPT_DIR" > /dev/null 2>&1; then
+        if docker run --rm \
+            -e DATABASE_URL=":memory:" \
+            fund-transparency-test \
+            sh -c "cargo test --package web 2>&1 || true" 2>&1; then
+            pass "Frontend tests passed (Docker, cargo test)"
+        else
+            skip "Frontend WASM tests (Docker cargo test fallback)"
+        fi
     else
-        skip "Frontend WASM tests (Docker cargo test fallback)"
+        skip "Frontend WASM tests (could not build test image)"
     fi
 else
     skip "Frontend WASM tests (no toolchain or Docker available)"
