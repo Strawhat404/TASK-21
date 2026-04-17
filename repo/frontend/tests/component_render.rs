@@ -195,7 +195,7 @@ fn project_card_renders_donate_button_with_correct_link() {
     let html = el.inner_html();
     assert!(
         html.contains("/donate/p-test-1"),
-        "Donate button should link to /donate/{id}"
+        "Donate button should link to /donate/p-test-1"
     );
     assert!(html.contains("Donate"), "Should show Donate text");
     cleanup(&el);
@@ -292,7 +292,7 @@ fn receipt_display_renders_view_project_link() {
     let html = el.inner_html();
     assert!(
         html.contains("/projects/p-1"),
-        "View Project link should point to /projects/{id}"
+        "View Project link should point to /projects/p-1"
     );
     assert!(html.contains("View Project"), "Should have View Project text");
     cleanup(&el);
